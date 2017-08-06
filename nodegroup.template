@@ -1,0 +1,454 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation sub-template for Auto-scaling group deployment
+Parameters:
+  BootDiskSize:
+    ConstraintDescription: Deployment supports 8 to 128 GB for boot volumes
+    Default: 8
+    Description: Allocated EBS storage for boot disk
+    MaxValue: 128
+    MinValue: 8
+    Type: Number
+  ClusterInfoHandle:
+    Description: ''
+    Type: String
+  ClusterName:
+    AllowedPattern: '([A-Za-z]{1}[0-9A-Za-z_-]*)'
+    ConstraintDescription: The ClusterName value must be alphanumeric
+    Default: KafkaCluster
+    Description: Confluent Cluster ID
+    Type: String
+  ConfluentEdition:
+    AllowedValues: [Confluent Open Source, Confluent Enterprise]
+    Default: Confluent Open Source
+    Description: Confluent Software Edition
+    Type: String
+  ConfluentSecurity:
+    AllowedValues: [Disabled, Enabled]
+    Default: Disabled
+    Description: Enable strong authentication for cluster access
+    Type: String
+  ConfluentVersion:
+    AllowedValues: [3.2.1, 3.2.0, 3.1.2]
+    ConstraintDescription: Supported versions of Confluent Platform within AWS Marketplace
+    Default: 3.2.1
+    Description: Confluent Software Version
+    Type: String
+  ConnectorURLs:
+    Default: ''
+    Description: Public locations (comma-separated list) from which to download additional Kafka Connect jars (eg https://s3.amazonaws.com/connector-bucket/dynamo)
+    Type: String
+  InstanceProfile:
+    Description: IAM Profile for the deployment
+    Type: String
+  KeyPairName:
+    Default: gen_key_pair
+    Description: Name of an existing EC2 key pair within the AWS region; all instances will launch with this key pair
+    Type: AWS::EC2::KeyPair::KeyName
+  LinuxOSAMI:
+    AllowedValues: [CentOS-7-HVM, Ubuntu-Server-16.04-LTS-HVM, Amazon-Linux-HVM]
+    ConstraintDescription: Supported versions of Linux AMIs for Confluent deployments
+    Default: Amazon-Linux-HVM
+    Description: Operating system AMI for cluster instances
+    Type: String
+  NodeDesignation:
+    Default: unspecified
+    Description: Tag for deployed instances
+    Type: String
+  NodeInstanceType:
+    AllowedValues:
+      - m3.medium
+      - m3.large
+      - m3.xlarge
+      - m4.large
+      - m4.xlarge
+      - m4.2xlarge
+      - m4.4xlarge
+      - c3.xlarge
+      - c3.2xlarge
+      - c3.4xlarge
+      - d2.xlarge
+      - d2.2xlarge
+      - d2.4xlarge
+      - d2.8xlarge
+      - i2.xlarge
+      - i2.2xlarge
+    ConstraintDescription: Must be a valid EC2 instance type.
+    Default: m3.large
+    Description: Instance Type
+    Type: String
+  NodeSecurityGroup:
+    Description: Comma separated list of security groups for the members of the cluster (e.g. sg-7f16e910,sg-4be93ca2);
+      The security groups must be in the same VPC as the subnets
+    Type: List<AWS::EC2::SecurityGroup::Id>
+  NodeSpotPrice:
+    AllowedPattern: '([0-9]{1}[.]{1}[0-9]{2})'
+    ConstraintDescription: Must be decimal numeric value
+    Default: '0.00'
+    Description: Spot Price to bid for requested instances (0.00 will result in using on-demand instances)
+    Type: String
+  NumNodes:
+    Default: 3
+    Description: Number of Nodes in Auto-scaling Group
+    MaxValue: 9
+    MinValue: 1
+    Type: Number
+  ParentStackName:
+    Description: Wrapper stack for this deployment
+    Type: String
+  PersistentStorage:
+    ConstraintDescription: No more than 1024 GB per device (4 TBper node)
+    Default: 0
+    Description: Allocated EBS storage for each block device (in GB; 4 devs per node); 0 indicates ephemeral storage only
+    MaxValue: 1024
+    MinValue: 0
+    Type: Number
+  QSS3BucketName:
+    AllowedPattern: '^[0-9a-zA-Z]+([0-9a-zA-Z-]*[0-9a-zA-Z])*$'
+    ConstraintDescription: Quick Start bucket name can include numbers, lowercase letters, uppercase letters,
+      and hyphens (-). It cannot start or end with a hyphen (-).
+    Description: S3 bucket name for the Quick Start assets. Quick Start bucket name can include numbers, lowercase
+      letters, uppercase letters, and hyphens (-). It cannot start or end with a hyphen (-).
+    Type: String
+  QSS3KeyPrefix:
+    AllowedPattern: '^[0-9a-zA-Z-]+(/[0-9a-zA-Z-]+)*$'
+    ConstraintDescription: Quick Start key prefix can include numbers, lowercase letters, uppercase letters,
+      hyphens (-), and forward slash (/). It cannot start or end with forward slash (/).
+    Default: confluent-kafka
+    Description: S3 key prefix for the Quick Start assets. Quick Start key prefix can include numbers, lowercase
+      letters, uppercase letters, hyphens (-), and forward slash (/). It cannot start or end with forward slash (/).
+    Type: String
+  QuickStartS3URL:
+    Default: https://s3.amazonaws.com
+    Description: Base URL for S3 busket which contains the quickstart node template
+    Type: String
+  SubnetID:
+    Description: Comma separated list of VPC subnet IDs for the cluster deployment (e.g. subnet-4b8d329f,subnet-bd73afc8);
+      VPC must exist with proper configuration for Confluent cluster access (internal and external)and the subnets
+      must be in the same VPC as the security groups
+    Type: List<AWS::EC2::Subnet::Id>
+
+Conditions:
+  EphemeralStorage:
+    !Equals [!Ref PersistentStorage, 0]
+  OnDemandInstances:
+    !Equals [!Ref NodeSpotPrice, '0.00']
+
+Mappings:
+  AWSAMIRegionMap:
+    AMI: {AMZNLINUXHVM: amzn-ami-hvm-2017.03.1.20170623-x86_64-gp2, CENTOS7HVM: CentOS Linux 7 x86_64 HVM EBS 1704_01-b7ee8a69-ee97-4a49-9e68-afaee216db2e-ami-d52f5bc3.4, US1604HVM: ubuntu/images/hvm-ssd/ubuntu-xenial-16.04-amd64-server-20170619.1}
+    ap-northeast-1: {AMZNLINUXHVM: ami-3bd3c45c, CENTOS7HVM: ami-29d1e34e, US1604HVM: ami-785c491f}
+    ap-northeast-2: {AMZNLINUXHVM: ami-e21cc38c, CENTOS7HVM: ami-08e93466, US1604HVM: ami-94d20dfa}
+    ap-south-1: {AMZNLINUXHVM: ami-47205e28, CENTOS7HVM: ami-3c0e7353, US1604HVM: ami-49e59a26}
+    ap-southeast-1: {AMZNLINUXHVM: ami-77af2014, CENTOS7HVM: ami-7d2eab1e, US1604HVM: ami-2378f540}
+    ap-southeast-2: {AMZNLINUXHVM: ami-10918173, CENTOS7HVM: ami-34171d57, US1604HVM: ami-e94e5e8a}
+    ca-central-1: {AMZNLINUXHVM: ami-a7aa15c3, CENTOS7HVM: ami-28823e4c, US1604HVM: ami-7ed56a1a}
+    eu-central-1: {AMZNLINUXHVM: ami-82be18ed, CENTOS7HVM: ami-fa2df395, US1604HVM: ami-1c45e273}
+    eu-west-1: {AMZNLINUXHVM: ami-d7b9a2b1, CENTOS7HVM: ami-061b1560, US1604HVM: ami-6d48500b}
+    eu-west-2: {AMZNLINUXHVM: ami-ed100689, CENTOS7HVM: ami-e05a4d84, US1604HVM: ami-cc7066a8}
+    sa-east-1: {AMZNLINUXHVM: ami-87dab1eb, CENTOS7HVM: ami-b31a75df, US1604HVM: ami-34afc458}
+    us-east-1: {AMZNLINUXHVM: ami-a4c7edb2, CENTOS7HVM: ami-46c1b650, US1604HVM: ami-d15a75c7}
+    us-east-2: {AMZNLINUXHVM: ami-8a7859ef, CENTOS7HVM: ami-18f8df7d, US1604HVM: ami-8b92b4ee}
+    us-west-1: {AMZNLINUXHVM: ami-327f5352, CENTOS7HVM: ami-f5d7f195, US1604HVM: ami-73f7da13}
+    us-west-2: {AMZNLINUXHVM: ami-6df1e514, CENTOS7HVM: ami-f4533694, US1604HVM: ami-835b4efa}
+  Linux2BootDisk:
+    Amazon-Linux-HVM: {BootDisk: /dev/xvda}
+    CentOS-7-HVM: {BootDisk: /dev/sda1}
+    Ubuntu-Server-16.04-LTS-HVM: {BootDisk: /dev/sda1}
+  LinuxAMINameMap:
+    Amazon-Linux-HVM: {Code: AMZNLINUXHVM}
+    CentOS-7-HVM: {Code: CENTOS7HVM}
+    Ubuntu-Server-16.04-LTS-HVM: {Code: US1604HVM}
+
+Resources:
+  NodeLaunchConfig:
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /tmp/sbin/compute-heap-opts:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/compute-heap-opts
+            /tmp/sbin/cp-deploy.sh:
+              group: root
+              mode: '00075'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/cp-deploy.sh
+            /tmp/sbin/cp-install.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/cp-install.sh
+            /tmp/sbin/cp-retrieve-connect-jars.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/cp-retrieve-connect-jars.sh
+            /tmp/sbin/cp-retrieve-scripts.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/cp-retrieve-scripts.sh
+            /tmp/sbin/gen-cluster-hosts.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/gen-cluster-hosts.sh
+            /tmp/sbin/post-cp-info.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/post-cp-info.sh
+            /tmp/sbin/prep-cp-instance.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/prep-cp-instance.sh
+            /tmp/sbin/prepare-disks.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/prepare-disks.sh
+            /tmp/sbin/wait-for-child-resource.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/wait-for-child-resource.sh
+            /tmp/sbin/wait-for-resource.sh:
+              group: root
+              mode: '000755'
+              owner: root
+              source:
+                Fn::Join:
+                  - /
+                  - - !Ref QuickStartS3URL
+                    - !Ref QSS3BucketName
+                    - !Ref QSS3KeyPrefix
+                    - scripts/wait-for-resource.sh
+    Properties:
+      AssociatePublicIpAddress: true
+      BlockDeviceMappings:
+        Fn::If:
+          - EphemeralStorage
+          - - DeviceName: !FindInMap [Linux2BootDisk, !Ref LinuxOSAMI, BootDisk]
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref BootDiskSize
+            - {DeviceName: /dev/sdb, VirtualName: ephemeral0}
+            - {DeviceName: /dev/sdc, VirtualName: ephemeral1}
+            - {DeviceName: /dev/sdd, VirtualName: ephemeral2}
+            - {DeviceName: /dev/sde, VirtualName: ephemeral3}
+            - {DeviceName: /dev/sdf, VirtualName: ephemeral4}
+            - {DeviceName: /dev/sdg, VirtualName: ephemeral5}
+            - {DeviceName: /dev/sdh, VirtualName: ephemeral6}
+            - {DeviceName: /dev/sdi, VirtualName: ephemeral7}
+            - {DeviceName: /dev/sdj, VirtualName: ephemeral8}
+            - {DeviceName: /dev/sdk, VirtualName: ephemeral9}
+            - {DeviceName: /dev/sdl, VirtualName: ephemeral10}
+            - {DeviceName: /dev/sdm, VirtualName: ephemeral11}
+          - - DeviceName: !FindInMap [Linux2BootDisk, !Ref LinuxOSAMI, BootDisk]
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref BootDiskSize
+            - DeviceName: /dev/sdb
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref PersistentStorage
+            - DeviceName: /dev/sdc
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref PersistentStorage
+            - DeviceName: /dev/sdd
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref PersistentStorage
+            - DeviceName: /dev/sde
+              Ebs:
+                DeleteOnTermination: 'True'
+                VolumeSize: !Ref PersistentStorage
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !FindInMap [AWSAMIRegionMap, !Ref 'AWS::Region', !FindInMap [LinuxAMINameMap, !Ref LinuxOSAMI, Code]]
+      InstanceType: !Ref NodeInstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroups: !Ref NodeSecurityGroup
+      SpotPrice: !If [OnDemandInstances, !Ref 'AWS::NoValue', !Ref NodeSpotPrice]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+
+          function error_exit
+          {
+            cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource Nodes
+            exit 1
+          }
+
+          PATH=$PATH:/usr/local/bin
+
+          ## Install core O/S packages
+          if [ ! -f /usr/bin/sshpass ] ; then
+            [ `which yum` ] && yum install -y sshpass
+            [ `which apt-get` ] && apt-get -y install sshpass
+          fi
+
+          which pip &> /dev/null
+          if [ $? -ne 0 ] ; then
+            [ `which yum` ] && $(yum install -y epel-release; yum install -y python-pip)
+            [ `which apt-get` ] && apt-get -y update && apt-get -y install python-pip
+          fi
+          pip install --upgrade pip
+          pip install awscli --ignore-installed six
+
+          ## Install and Update CloudFormation
+          easy_install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.tar.gz
+
+          ## Signal that the node is up
+          cfn-signal -e 0 --stack ${AWS::StackName} --region ${AWS::Region} --resource Nodes
+
+          ## Save off other cluster details in prep for configuration
+          echo ${ClusterName} > /tmp/clustername
+          echo ${ConfluentEdition} > /tmp/cedition
+          echo ${ConfluentSecurity} > /tmp/csecurity
+          [ "${ConfluentSecurity}" = 'Disabled' ] && rm /tmp/csecurity
+          echo ${ConfluentVersion} > /tmp/cversion
+
+          ## Retrieve scripts to deploy Confluent on the instances
+          ## cfn-init downloads everything and then we're off to the races
+          cfn-init -v --stack ${AWS::StackName} --resource NodeLaunchConfig --region ${AWS::Region}
+          AMI_SBIN=/tmp/sbin
+
+          ## Prepare the instance
+          $AMI_SBIN/prep-cp-instance.sh
+          . $AMI_SBIN/prepare-disks.sh
+
+          ## Wait for all nodes to come on-line
+          echo "Waiting for nodes to come online..." >> $LOG
+          $AMI_SBIN/wait-for-child-resource.sh ${ParentStackName} ZookeeperStack Nodes
+          $AMI_SBIN/wait-for-child-resource.sh ${ParentStackName} BrokerStack Nodes
+          $AMI_SBIN/wait-for-child-resource.sh ${ParentStackName} WorkerStack Nodes
+
+          ## Now find the private IP addresses of all deployed nodes
+          ##    (generating /tmp/cphosts and /tmp/<role> files)
+          $AMI_SBIN/gen-cluster-hosts.sh ${ParentStackName}
+
+          ## Tag the instance (now that we''re sure of launch index)
+          ##    NOTE: ami_launch_index is correct only within a single subnet)
+          instance_id=$(curl -f http://instance-data/latest/meta-data/instance-id)
+          ami_launch_index=$(curl -f http://instance-data/latest/meta-data/ami-launch-index)
+          launch_node=$(grep -w `hostname` /tmp/${NodeDesignation}s | awk '{print $2}')
+
+          if [ -n "$launch_node" ] ; then
+            launch_index=${!launch_node#*NODE}
+          else
+            launch_index=${!ami_launch_index}
+          fi
+
+          if [ -n "$instance_id" ] ; then
+            instance_tag=${ClusterName}-${NodeDesignation}-${!launch_index}
+            aws ec2 create-tags --region ${AWS::Region} --resources $instance_id --tags Key=Name,Value=$instance_tag
+          fi
+
+          ## Run the steps to install the software then configure and start the services
+          $AMI_SBIN/cp-install.sh 2> /tmp/cp-install.err
+          $AMI_SBIN/cp-deploy.sh 2> /tmp/cp-deploy.err
+
+          CONNECTOR_URLS=${ConnectorURLs}
+          if [ -n "$CONNECTOR_URLS" ] ; then
+            for csrc in ${!CONNECTOR_URLS/,/ } ; do
+              $AMI_SBIN/cp-retrieve-connect-jars.sh $csrc 2>&1 | tee -a /tmp/cp-retrieve-connect-jars.err
+            done
+          fi
+
+          ## If all went well, signal success (must be done by ALL nodes in group)
+          cfn-signal -e 0 -r 'Confluent Platform node deployment complete' '${NodesReadyHandle}'
+
+          ## Wait for all nodes to issue the signal
+          $AMI_SBIN/wait-for-resource.sh NodesReadyCondition
+
+          ## Signal back information for outputs (now that all nodes are up)
+          $AMI_SBIN/post-cp-info.sh '${ClusterInfoHandle}'
+
+    Type: AWS::AutoScaling::LaunchConfiguration
+  Nodes:
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref NumNodes
+        Timeout: PT60M
+    Properties:
+      DesiredCapacity: !Ref NumNodes
+      LaunchConfigurationName: !Ref NodeLaunchConfig
+      MaxSize: !Ref NumNodes
+      MinSize: 0
+      VPCZoneIdentifier: !Ref SubnetID
+      Tags:
+        - {Key: auto_off, Value: true, PropagateAtLaunch: true}
+    Type: AWS::AutoScaling::AutoScalingGroup
+  NodesReadyCondition:
+    Properties:
+      Count: !Ref NumNodes
+      Handle: !Ref NodesReadyHandle
+      Timeout: 36000
+    Type: AWS::CloudFormation::WaitCondition
+  NodesReadyHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
